@@ -3,7 +3,8 @@ name: Unpack TERAPHON-CF package
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - 'TERAPHON_LICENSE_GITHUB_DEPLOY.zip'
   workflow_dispatch:
@@ -18,6 +19,7 @@ concurrency:
 jobs:
   unpack:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,47 +27,116 @@ jobs:
           ref: main
           persist-credentials: true
 
-      - name: Validate and unpack six TERAPHON files
+      - name: Validate and unpack TERAPHON files
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile
-          archive = Path('TERAPHON_LICENSE_GITHUB_DEPLOY.zip')
+
+          archive = Path(
+              'TERAPHON_LICENSE_GITHUB_DEPLOY.zip'
+          )
+
           if not archive.is_file():
-              raise SystemExit('Upload TERAPHON_LICENSE_GITHUB_DEPLOY.zip to the repository root first.')
+              raise SystemExit(
+                  'TERAPHON ZIP not found!'
+              )
+
           expected = {
               '.github/workflows/teraphon-license-deploy.yml',
-              'worker/README.md', 'worker/schema.sql',
+              'worker/README.md',
+              'worker/schema.sql',
               'worker/teraphon-license.js',
               'worker/test-payment-hooks.mjs',
               'worker/test-teraphon-worker.mjs',
           }
+
           with ZipFile(archive) as z:
-              files = {i.filename for i in z.infolist() if not i.is_dir()}
+              files = {
+                  i.filename
+                  for i in z.infolist()
+                  if not i.is_dir()
+              }
+
               if files != expected:
-                  raise SystemExit(f'Unexpected ZIP contents: {sorted(files ^ expected)}')
-              if sum(i.file_size for i in z.infolist()) > 2_000_000:
-                  raise SystemExit('Unexpected ZIP size; refusing to extract.')
+                  raise SystemExit(
+                      f'Unexpected ZIP contents: '
+                      f'{sorted(files ^ expected)}'
+                  )
+
+              total = sum(
+                  i.file_size
+                  for i in z.infolist()
+              )
+
+              if total > 2_000_000:
+                  raise SystemExit(
+                      'ZIP too large!'
+                  )
+
+              if z.testzip() is not None:
+                  raise SystemExit(
+                      'ZIP integrity check failed!'
+                  )
+
               for name in sorted(expected):
-                  target = Path(name)
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  target.write_bytes(z.read(name))
-          print('Verified and unpacked all six TERAPHON files.')
+
+                  if name == (
+                      '.github/workflows/'
+                      'teraphon-license-deploy.yml'
+                  ):
+                      target = Path(
+                          'worker/'
+                          'teraphon-license-deploy.yml'
+                      )
+                  else:
+                      target = Path(name)
+
+                  target.parent.mkdir(
+                      parents=True,
+                      exist_ok=True
+                  )
+
+                  target.write_bytes(
+                      z.read(name)
+                  )
+
+                  print(f'OK: {target}')
+
+          print(
+              'SUCCESS: All 6 files unpacked!'
+          )
           PY
 
-      - name: Commit unpacked source (never deploy automatically)
+      - name: Commit unpacked files
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .github/workflows/teraphon-license-deploy.yml worker/
-          if ! git diff --cached --quiet; then
-            git commit -m 'Unpack TERAPHON license Worker source'
-            git push origin HEAD:main
+
+          git config user.name \
+            'github-actions[bot]'
+
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add worker/
+
+          if git diff --cached --quiet; then
+            echo "Already up to date."
           else
-            echo 'Files already up to date.'
+            git commit -m \
+              "Unpack TERAPHON-CF Worker"
+
+            git push origin HEAD:main
           fi
+
+      - name: Complete
+        run: |
+          echo "TERAPHON-CF unpack complete"
+          echo "Worker source ready"
+          echo "Deploy is not activated"
+          echo "BrakeMonster untouched"
           

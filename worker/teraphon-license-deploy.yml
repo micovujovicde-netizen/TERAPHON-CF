@@ -1,0 +1,110 @@
+name: TERAPHON — deploy license Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: teraphon-license-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Verify and deploy TERAPHON only
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check syntax and licensing integration tests
+        run: |
+          set -euo pipefail
+          node --check worker/teraphon-license.js
+          node --no-warnings worker/test-teraphon-worker.mjs
+          node --no-warnings worker/test-payment-hooks.mjs
+
+      - name: Find existing TERAPHON D1 database (never create or replace)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, urllib.parse, urllib.request
+          token = os.environ.get('CLOUDFLARE_API_TOKEN', '')
+          account = os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
+          if not token or not re.fullmatch(r'[a-fA-F0-9]{32}', account):
+              raise SystemExit('Configure CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as GitHub Actions secrets first.')
+          target = 'teraphon-licenses'
+          url = ('https://api.cloudflare.com/client/v4/accounts/' + account +
+                 '/d1/database?' + urllib.parse.urlencode({'name': target, 'per_page': 100}))
+          request = urllib.request.Request(url, headers={
+              'Authorization': 'Bearer ' + token,
+              'Accept': 'application/json',
+              'User-Agent': 'teraphon-license-ci/1.0'})
+          with urllib.request.urlopen(request, timeout=35) as response:
+              result = json.load(response)
+          if not result.get('success'):
+              raise SystemExit('Could not read D1 list; review the Cloudflare token permissions.')
+          matches = [db for db in result.get('result', []) if db.get('name') == target]
+          if len(matches) != 1 or not re.fullmatch(r'[0-9a-fA-F-]{36}', matches[0].get('uuid', '')):
+              raise SystemExit('Expected exactly one existing teraphon-licenses D1 database; refusing to deploy.')
+          database_id = matches[0]['uuid']
+          # Runtime-only config; never commit database/account credentials to Git.
+          config = '\n'.join([
+              'name = "teraphon-license"',
+              'main = "teraphon-license.js"',
+              'compatibility_date = "2026-11-20"',
+              'workers_dev = true',
+              '',
+              '[vars]',
+              'BILLING_ENABLED = "false"',
+              'TERA_PRODUCT_MONTHLY = "prod_g1lpJZPJbfKTkhr8qiqbn"',
+              'TERA_PRODUCT_YEARLY = "prod_6cQTQHjizsAhj9BAkvJoIn"',
+              'TERA_PRODUCT_LIFETIME = "prod_6fnL2AfTLkXb9WU1BYDZzL"',
+              '',
+              '[[d1_databases]]',
+              'binding = "DB"',
+              'database_name = "teraphon-licenses"',
+              'database_id = "' + database_id + '"',
+              ''
+          ])
+          with open('worker/wrangler.toml','w',encoding='utf-8') as f: f.write(config)
+          print('Existing TERAPHON D1 located. Billing remains OFF.')
+          PY
+
+      - name: Deploy only teraphon-license Worker
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          command: deploy
+
+      - name: Check live health endpoint (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, time, urllib.request
+          url='https://teraphon-license.micovujovic-de.workers.dev/v1/health'
+          for attempt in range(8):
+              try:
+                  req=urllib.request.Request(url,headers={'Cache-Control':'no-cache'})
+                  with urllib.request.urlopen(req,timeout=15) as response: data=json.load(response)
+                  if data.get('status')=='online' and data.get('productConfigured') is True and data.get('billingEnabled') is False:
+                      print('TERAPHON Worker is online with 3 products; billing OFF.');break
+              except Exception:
+                  pass
+              if attempt==7: raise SystemExit('Worker deployed, but expected safe /v1/health response was not observed.')
+              time.sleep(5)
+          PY

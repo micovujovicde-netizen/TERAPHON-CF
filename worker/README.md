@@ -66,6 +66,41 @@ No secret is shipped in this package. The workflow is not supposed to alter thes
 
 Do not enable billing (`BILLING_ENABLED=true`) until the actual paid webhook and claim workflow is demonstrated against real controlled purchases. If enabling billing later, update only this TERAPHON workflow after validation.
 
+
+## Verified-payment email via Resend (optional; disabled by default)
+
+A buyer receives **one TERAPHON activation code for three Android devices** — not three separate licences. Automatic mail is only sent for a *signed, accepted* `subscription.paid` or paid lifetime `checkout.completed` event whose product matches TERAPHON. Duplicate events and subscription renewals do **not** create extra codes or separate accounts.
+
+### Email prerequisites
+
+In Cloudflare **Workers & Pages → teraphon-license → Settings → Variables and Secrets**, keep the existing `CREEM_API_KEY`, `CREEM_WEBHOOK_SECRET` and `ACTIVATION_ENCRYPTION_KEY` unchanged. Add secrets:
+
+- `RESEND_API_KEY` — an API key with send rights from your verified Resend account.
+- `TERAPHON_EMAIL_FROM` — sender identity on a **verified domain** (for example an address at teraphonia.com, but use the actual verified address).
+
+Add an ordinary Worker variable `EMAIL_ENABLED` with value **`false`** while testing. The default if missing is also false. To opt in after completing all tests, change only this TERAPHON variable to `true`. Keep `BILLING_ENABLED=false` until separate paid checkout production verification is complete. **Do not put keys into files, GitHub commits or chat.**
+
+### Safe behaviour
+
+- There is a seventh, *additive* D1 table, `teraphon_email_outbox`. When mail is enabled, the Worker creates it automatically on the first **verified paid** webhook; the table definition is also archived in `schema.sql`.
+- Code generation uses existing AES-GCM encryption from `ACTIVATION_ENCRYPTION_KEY`; keep that key unchanged.
+- An email is sent via Resend with a stable idempotency key. A completed send is tracked so renewals cannot produce repeated activation messages.
+- A verified paid licence remains active **even when Resend is temporarily unavailable**. Unsent messages remain pending in D1, retry on a signed duplicate paid webhook, or via a configured Worker Cron Trigger calling `scheduled()`.
+- For reliable automatic retries, add a Cron Trigger to the TERAPHON Worker (e.g. every 15 minutes) and keep it in the *actual* `.github/workflows/teraphon-license-deploy.yml` generated Wrangler config. The currently active GitHub workflow does **not** configure a cron. Without a cron, retries are opportunistic only.
+- `GET /v1/health` now includes `emailEnabled`, indicating presence of the required mail configuration and its enable flag (not a test of real delivery).
+
+### Real test checklist
+
+1. Run all included Node tests and check `/v1/health` for `billingEnabled=false`, `emailEnabled=false` before changing anything.
+2. Confirm Resend sender verification and Cloudflare secrets without disclosing secret values.
+3. Verify Creem webhook target and HMAC signature in Creem dashboard logs.
+4. With a controlled test environment, prove that one signed paid event creates one active code and sends exactly one email; a repeated event should not send another.
+5. Check that the same code activates devices 1, 2 and 3, and device 4 is refused.
+6. Confirm failure/retry, refunds, cancellation/renewal, no mail for an unmatched product, and no mail on a forged signature.
+7. Only when verified, explicitly enable `EMAIL_ENABLED=true`; production `BILLING_ENABLED` stays OFF until separately approved.
+
+**Repo deployment caution:** the existing `unpack.yml` writes the bundled deployment workflow under `worker/teraphon-license-deploy.yml`, not the active `.github/workflows/teraphon-license-deploy.yml`. That active workflow must be updated separately if you choose to add Cron Triggers or change its generated Wrangler variables. Updating this package alone does not edit it.
+
 ## Quick checks
 
 ```text

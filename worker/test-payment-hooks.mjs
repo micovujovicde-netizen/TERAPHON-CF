@@ -8,7 +8,7 @@ const moduleUrl=`data:text/javascript;base64,${Buffer.from(src).toString('base64
 const worker=(await import(moduleUrl)).default;
 class DB {
  constructor(){this.sql=new DatabaseSync(':memory:');this.sql.exec(readFileSync(new URL('./schema.sql',import.meta.url),'utf8'));}
- prepare(query){const map=[];const sql=query.replace(/\?(\d+)/g,(_m,n)=>{map.push(Number(n)-1);return '?'});const s=this.sql.prepare(sql);return {bind(...args){const items=map.map(i=>args[i]);return {run:()=>s.run(...items),all:()=>({results:s.all(...items)}),first:()=>s.get(...items)||null}}}};
+ prepare(query){const map=[];const sql=query.replace(/\?(\d+)/g,(_m,n)=>{map.push(Number(n)-1);return '?'});const s=this.sql.prepare(sql);return {run:()=>s.run(),bind(...args){const items=map.map(i=>args[i]);return {run:()=>s.run(...items),all:()=>({results:s.all(...items)}),first:()=>s.get(...items)||null}}}};
  async batch(statements){this.sql.exec('BEGIN'); try {let results=[]; for(const statement of statements) results.push(await statement.run());this.sql.exec('COMMIT');return results;}catch(e){this.sql.exec('ROLLBACK');throw e}}
 }
 const DB1=new DB();
@@ -64,4 +64,58 @@ r=await run('/v1/license','GET',{Authorization:'Bearer '+token2});test(!r.data.a
 const chk2=structuredClone(checkoutObj); chk2.id='ch_paid_2';chk2.order.id='ord_paid_2';chk2.subscription.id='sub_paid_2';chk2.metadata.tera_device_hash=h2;
 r=await signed(event('checkout.completed',chk2));test(r.code===200,'checkout arrives after paid');
 r=await run('/v1/license','GET',{Authorization:'Bearer '+token2});test(r.data.active,'paid-first eventually active');
+
+// Production mail uses false by default; exercise its entire mocked signed payment path.
+env.EMAIL_ENABLED='true';
+env.RESEND_API_KEY='re_test_key_only';
+env.TERAPHON_EMAIL_FROM='support@teraphonia.com';
+env.ACTIVATION_ENCRYPTION_KEY=Buffer.alloc(32,7).toString('base64');
+const messages=[];
+let simulateEmailFailure=false;
+globalThis.fetch=async (url, opts) => {
+  assert.equal(url,'https://api.resend.com/emails');
+  if(simulateEmailFailure)return new Response('temporary failure',{status:503});
+  messages.push({payload:JSON.parse(opts.body), key:opts.headers['Idempotency-Key']});
+  return new Response(JSON.stringify({id:'email_'+messages.length}),{status:200,headers:{'content-type':'application/json'}});
+};
+const lifetimePaidEmail=event('checkout.completed',{
+  id:'ch_email_1',status:'completed',
+  order:{id:'ord_email_1',status:'paid',customer:'cust_email_1',product:'prod_TeraFakeLife03',transaction:'tx_email_1'},
+  product:{id:'prod_TeraFakeLife03'},
+  customer:{id:'cust_email_1',email:'buyer@example.com'}
+});
+r=await signed(lifetimePaidEmail);
+test(r.code===200&&r.data.action==='lifetime_paid','paid lifetime activation is accepted with mail enabled');
+test(messages.length===1&&messages[0].payload.to[0]==='buyer@example.com','one confirmation email sent to verified buyer');
+test(messages[0].payload.text.includes('3 devices')&&/TP1-[A-Z0-9-]+/.test(messages[0].payload.text),'email contains one activation code for three devices');
+test(DB1.sql.prepare("SELECT state FROM teraphon_email_outbox WHERE license_id='ord_email_1'").get().state==='sent','D1 outbox marks delivery as sent');
+r=await signed(lifetimePaidEmail);
+test(r.data.duplicate===true&&messages.length===1,'duplicate webhook does not send duplicate mail');
+const activationCode=messages[0].payload.text.match(/TP1-[A-Z0-9-]+/)[0];
+for(const suffix of ['b','c','d']){
+  const t=suffix.repeat(64);
+  r=await run('/v1/activate','POST',{Authorization:'Bearer '+t,'content-type':'application/json'},JSON.stringify({code:activationCode}));
+  test(r.code===200,'activation code grants device '+suffix);
+}
+r=await run('/v1/activate','POST',{Authorization:'Bearer '+'a'.repeat(64),'content-type':'application/json'},JSON.stringify({code:activationCode}));
+test(r.code===409,'fourth device is not allowed');
+const mail2=event('checkout.completed',{
+  id:'ch_email_2',status:'completed',
+  order:{id:'ord_email_2',status:'paid',customer:'cust_email_2',product:'prod_TeraFakeLife03',transaction:'tx_email_2'},
+  product:{id:'prod_TeraFakeLife03'},customer:{id:'cust_email_2',email:'buyer2@example.com'}
+});
+simulateEmailFailure=true;
+r=await signed(mail2);
+test(r.code===200&&r.data.action==='lifetime_paid','Resend outage cannot revoke a valid paid license');
+test(DB1.sql.prepare("SELECT state FROM teraphon_email_outbox WHERE license_id='ord_email_2'").get().state==='pending','failed mail remains queued');
+simulateEmailFailure=false;
+r=await signed(mail2);
+test(r.code===200&&r.data.duplicate===true&&messages.length===2,'signed duplicate webhook retries pending mail');
+test(DB1.sql.prepare("SELECT state FROM teraphon_email_outbox WHERE license_id='ord_email_2'").get().state==='sent','retried mail marked delivered');
+const forgedMail=event('checkout.completed',{...mail2.object,
+  order:{...mail2.object.order,id:'ord_email_forged'}});
+r=await run('/webhook','POST',{'creem-signature':'0'.repeat(64),'content-type':'application/json'},JSON.stringify(forgedMail));
+test(r.code===401&&messages.length===2,'forged signature does not email');
+globalThis.fetch=savedFetch;
+
 console.log(`PASS ${passed} V4 integration checks`);

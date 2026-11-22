@@ -37,3 +37,16 @@ CREATE TABLE IF NOT EXISTS teraphon_activation_codes (
  code_nonce TEXT NOT NULL,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+
+-- Additive mail queue; does not modify existing licence tables.
+CREATE TABLE IF NOT EXISTS teraphon_email_outbox (
+  license_id TEXT PRIMARY KEY NOT NULL,
+  recipient_email TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER NOT NULL DEFAULT 0,
+  message_id TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  sent_at TEXT
+);

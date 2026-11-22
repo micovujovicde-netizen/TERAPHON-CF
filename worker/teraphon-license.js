@@ -295,6 +295,137 @@ async function checkout(request,env,products) {
   return json({url:u.toString()});
 }
 
+
+// TERAPHON-only transactional confirmation mail via Resend.
+// One activation code permits three devices; no secrets or codes are logged.
+// EMAIL_ENABLED defaults OFF until sender domain, Resend key and live webhook are verified.
+function emailReady(env) {
+  const sender=env.TERAPHON_EMAIL_FROM;
+  return env.EMAIL_ENABLED==='true' && Boolean(env.RESEND_API_KEY) &&
+    typeof sender==='string' && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(sender) &&
+    Boolean(env.ACTIVATION_ENCRYPTION_KEY) && Boolean(env.DB);
+}
+async function ensureMailOutbox(db) {
+  // Additive one-time migration. Existing license tables are never recreated/dropped.
+  await db.prepare(`CREATE TABLE IF NOT EXISTS teraphon_email_outbox (
+    license_id TEXT PRIMARY KEY NOT NULL,
+    recipient_email TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    message_id TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    sent_at TEXT
+  )`).run();
+}
+async function codeForMail(env, licenseID) {
+  let row=await env.DB.prepare('SELECT * FROM teraphon_activation_codes WHERE license_id=?1')
+    .bind(licenseID).first();
+  if(!row) {
+    const code=generateActivationCode();
+    const secured=await protectCode(env,code);
+    await env.DB.prepare(`INSERT OR IGNORE INTO teraphon_activation_codes
+      (license_id,code_hash,code_cipher,code_nonce) VALUES(?1,?2,?3,?4)`)
+      .bind(licenseID,await sha256(code),secured.cipher,secured.nonce).run();
+    row=await env.DB.prepare('SELECT * FROM teraphon_activation_codes WHERE license_id=?1')
+      .bind(licenseID).first();
+  }
+  if(!row)throw new Error('Activation code storage unavailable');
+  return displayActivationCode(await restoreCode(env,row));
+}
+function planLabel(plan, products) {
+  if(plan===products.lifetime)return 'Lifetime';
+  if(plan===products.yearly)return 'Yearly';
+  if(plan===products.monthly)return 'Monthly';
+  return 'Paid';
+}
+async function sendMailRecord(env, licenseID, products) {
+  if(!emailReady(env))return;
+  const db=env.DB;
+  const row=await db.prepare(`SELECT o.license_id,o.recipient_email,o.state,o.last_attempt_at,
+       l.product_id,l.status,l.expires_at
+       FROM teraphon_email_outbox o JOIN licenses l ON l.id=o.license_id
+       WHERE o.license_id=?1`).bind(licenseID).first();
+  if(!row || row.state==='sent' || !licensed(row,products))return;
+  // Atomic lease prevents concurrent webhooks from emailing the same customer.
+  // The 5-minute expiry allows recovery after a Worker interruption.
+  const now=Date.now();
+  const claim=await db.prepare(`UPDATE teraphon_email_outbox
+    SET state='sending',attempts=attempts+1,last_attempt_at=?2
+    WHERE license_id=?1 AND (state='pending' OR (state='sending' AND last_attempt_at<?3))`)
+    .bind(licenseID,now,now-300000).run();
+  const changes=Number(claim?.meta?.changes??claim?.changes??0);
+  if(changes!==1)return;
+  try {
+    const code=await codeForMail(env,licenseID);
+    const subject='Your TERAPHON activation — 3 devices';
+    const body=[
+      'Thank you for your TERAPHON purchase.',
+      '',
+      'Plan: '+planLabel(row.product_id,products),
+      'Your activation code: '+code,
+      '',
+      'One activation code unlocks TERAPHON on up to 3 devices.',
+      'Open TERAPHON, choose Activate and enter this code on each device.',
+      'Keep this email private. Do not share your code.',
+      '',
+      'TERAPHON — https://teraphonia.com',
+    ].join('\n');
+    const result=await fetch('https://api.resend.com/emails',{
+      method:'POST',redirect:'manual',
+      headers:{
+        'Authorization':'Bearer '+env.RESEND_API_KEY,
+        'Content-Type':'application/json',
+        'Idempotency-Key':'teraphon-activation-'+(await sha256(licenseID)),
+      },
+      body:JSON.stringify({from:env.TERAPHON_EMAIL_FROM,
+        to:[row.recipient_email],subject,text:body}),
+    });
+    if(!result.ok)throw new Error('Resend HTTP '+result.status);
+    const response=await result.json();
+    const msgId=str(response?.id,160);
+    if(!msgId)throw new Error('Resend response missing ID');
+    await db.prepare(`UPDATE teraphon_email_outbox SET state='sent',message_id=?2,
+      sent_at=CURRENT_TIMESTAMP WHERE license_id=?1 AND state='sending'`)
+      .bind(licenseID,msgId).run();
+  } catch(error) {
+    // Failed email must NEVER roll back a verified paid licence.
+    try {
+      await db.prepare(`UPDATE teraphon_email_outbox SET state='pending'
+        WHERE license_id=?1 AND state='sending'`).bind(licenseID).run();
+    } catch (_) { /* Leave the timed lease for a safe later retry. */ }
+    console.error('TERAPHON activation mail needs retry',String(error?.name||'Error'));
+  }
+}
+async function mailAfterVerifiedPayment(env, obj, eventType, action, products) {
+  if(!emailReady(env) || !['paid','lifetime_paid','lifetime_paid_transaction_link_missing'].includes(action))return;
+  const licenseID=eventType==='subscription.paid' ? id(obj) : id(obj.order);
+  if(!licenseID)return;
+  try {
+    await ensureMailOutbox(env.DB);
+    const row=await env.DB.prepare(`SELECT id,customer_email,status,product_id,expires_at
+       FROM licenses WHERE id=?1`).bind(licenseID).first();
+    if(!row || !licensed(row,products) || !row.customer_email ||
+       !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(row.customer_email))return;
+    await env.DB.prepare(`INSERT OR IGNORE INTO teraphon_email_outbox
+       (license_id,recipient_email) VALUES(?1,?2)`)
+       .bind(licenseID,row.customer_email).run();
+    await sendMailRecord(env,licenseID,products);
+  } catch(error) {
+    // Payment is accepted even if the independent mail subsystem fails.
+    console.error('TERAPHON activation mail queue deferred',String(error?.name||'Error'));
+  }
+}
+async function retryPendingMail(env) {
+  if(!emailReady(env))return;
+  await ensureMailOutbox(env.DB);
+  const rows=(await env.DB.prepare(`SELECT license_id FROM teraphon_email_outbox
+    WHERE state='pending' OR (state='sending' AND last_attempt_at<?1)
+    ORDER BY created_at ASC LIMIT 10`).bind(Date.now()-300000).all()).results||[];
+  const products=configuredProducts(env);
+  for(const item of rows)await sendMailRecord(env,item.license_id,products);
+}
+
 function eventStatement(db, event, action) {
   // Deliberately NOT INSERT OR IGNORE: duplicate ID causes atomic batch rollback,
   // so concurrent deliveries cannot both commit license changes.
@@ -404,13 +535,13 @@ export default {
       return json({service:'TERAPHON Licensing',status:'online',
         webhookConfigured:Boolean(env.CREEM_WEBHOOK_SECRET),
         storageConfigured:Boolean(env.DB),productConfigured:productsReady(env),
-        liveWritesEnabled:true,billingEnabled:billingOn(env),version:'teraphon-v1-prepared'});
+        liveWritesEnabled:true,billingEnabled:billingOn(env),emailEnabled:emailReady(env),version:'teraphon-v1-prepared'});
     }
     // Only our official website can call the licensed checkout via browsers.
     const origin=request.headers.get('Origin');
     if(origin && !SITE_ORIGINS.has(origin)) return json({error:'Origin forbidden'},403);
     if(u.pathname==='/v1/health' && request.method==='GET')
-      return withCors(json({status:'online',billingEnabled:billingOn(env),productConfigured:productsReady(env),version:'teraphon-v1-prepared'}),request);
+      return withCors(json({status:'online',billingEnabled:billingOn(env),productConfigured:productsReady(env),emailEnabled:emailReady(env),version:'teraphon-v1-prepared'}),request);
     if(u.pathname==='/v1/license' && request.method==='GET') {
       if(!env.DB)return json({error:'Database unavailable'},503);
       const token=bearer(request);if(!token)return json({error:'Unauthorized'},401);
@@ -469,8 +600,13 @@ export default {
         !event.object || typeof event.object!=='object' || Array.isArray(event.object))
       return json({error:'Invalid event'},400);
     try {
-      if (await isAlreadyHandled(env.DB,event.id))
+      if (await isAlreadyHandled(env.DB,event.id)) {
+        // Safe retry if a signed, previously processed payment was delivered twice.
+        await mailAfterVerifiedPayment(env,event.object,event.eventType,
+          event.eventType==='subscription.paid'?'paid':
+          event.eventType==='checkout.completed'?'lifetime_paid':'ignored',products);
         return json({received:true,duplicate:true});
+      }
       const obj=event.object, ms=event.created_at;
       if (testPayload(event,obj)) return await saveEvent(env.DB,event,'test_ignored');
       if (!KNOWN_EVENTS.has(event.eventType)) return await saveEvent(env.DB,event,'unknown_ignored');
@@ -484,7 +620,9 @@ export default {
       }
       if (result.error) return json({error:result.error},422);
       const bindings=bindingStatements(env.DB,obj,event.eventType,productPlan);
-      return await saveEvent(env.DB,event,result.action,[...result.sql,...bindings]);
+      const response=await saveEvent(env.DB,event,result.action,[...result.sql,...bindings]);
+      await mailAfterVerifiedPayment(env,obj,event.eventType,result.action,products);
+      return response;
     } catch(err) {
       // Concurrency: unique webhook_events.event_id prevents double commits.
       if (await isAlreadyHandled(env.DB,event.id).catch(()=>false))
@@ -492,5 +630,11 @@ export default {
       console.error('License webhook D1 failure',String(err?.message||'unknown').slice(0,200));
       return json({error:'Storage unavailable; retry delivery'},503);
     }
+  },
+  // Configure a Cron Trigger in Cloudflare only after transactional mail is approved.
+  async scheduled(_event, env, ctx) {
+    const task=retryPendingMail(env);
+    if(ctx?.waitUntil)ctx.waitUntil(task);
+    else await task;
   }
 };

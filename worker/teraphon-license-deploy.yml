@@ -66,11 +66,7 @@ jobs:
               'compatibility_date = "2026-11-20"',
               'workers_dev = true',
               '',
-              '[vars]',
-              'BILLING_ENABLED = "false"',
-              'TERA_PRODUCT_MONTHLY = "prod_g1lpJZPJbfKTkhr8qiqbn"',
-              'TERA_PRODUCT_YEARLY = "prod_6cQTQHjizsAhj9BAkvJoIn"',
-              'TERA_PRODUCT_LIFETIME = "prod_6fnL2AfTLkXb9WU1BYDZzL"',
+              'keep_vars = true',
               '',
               '[[d1_databases]]',
               'binding = "DB"',
@@ -79,7 +75,7 @@ jobs:
               ''
           ])
           with open('worker/wrangler.toml','w',encoding='utf-8') as f: f.write(config)
-          print('Existing TERAPHON D1 located. Billing remains OFF.')
+          print('Existing TERAPHON D1 located. Existing variables preserved.')
           PY
 
       - name: Deploy only teraphon-license Worker
@@ -101,8 +97,8 @@ jobs:
               try:
                   req=urllib.request.Request(url,headers={'Cache-Control':'no-cache'})
                   with urllib.request.urlopen(req,timeout=15) as response: data=json.load(response)
-                  if data.get('status')=='online' and data.get('productConfigured') is True and data.get('billingEnabled') is False:
-                      print('TERAPHON Worker is online with 3 products; billing OFF.');break
+                  if data.get('status')=='online' and data.get('productConfigured') is True:
+                      print('TERAPHON Worker is online with 3 products.');break
               except Exception:
                   pass
               if attempt==7: raise SystemExit('Worker deployed, but expected safe /v1/health response was not observed.')

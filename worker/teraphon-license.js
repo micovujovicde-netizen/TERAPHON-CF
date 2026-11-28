@@ -526,11 +526,64 @@ async function stmtReversal(db,type,obj,ms) {
   ]};
 }
 
+// Gift administration: existing license schema, no payment or email side effects.
+async function giftAdmin(request,env,products) {
+  const headers={'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-frame-options':'DENY','referrer-policy':'no-referrer','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"};
+  if(request.method==='GET') return new Response(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TERAPHON Gift Admin</title><style>body{background:#000;color:white;font:22px Arial;max-width:700px;margin:auto;padding:20px}h1{color:#dfbd55}input,button{box-sizing:border-box;width:100%;font:inherit;padding:15px;margin:8px 0}button{background:#dfbd55;color:#000;border:0;border-radius:5px}pre{white-space:pre-wrap;overflow-wrap:anywhere}section{border-top:1px solid #777;padding:12px 0}</style><h1>TERAPHON</h1><h2>GIFT LICENSE ADMIN</h2><p>Lifetime · 3 devices</p><input id="key" type="password" placeholder="Admin password" autocomplete="off"><input id="name" placeholder="Recipient name" maxlength="160"><button id="gen">GENERATE GIFT CODE</button><pre id="result" role="status"></pre><button id="copy" disabled>COPY CODE</button><button id="list">MANAGE GIFT LICENSES</button><div id="items"></div><script>
+const el=id=>document.getElementById(id);let code='';
+async function api(action,extra={}){const r=await fetch(location.pathname,{method:'POST',headers:{Authorization:'Bearer '+el('key').value,'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d;}
+async function run(fn){try{await fn()}catch(e){el('result').textContent=e.message;}}
+el('gen').onclick=()=>run(async()=>{el('gen').disabled=true;code='';el('copy').disabled=true;try{const d=await api('create',{name:el('name').value});code=d.code;el('result').textContent=code;el('copy').disabled=false;}finally{el('gen').disabled=false;}});
+el('copy').onclick=()=>run(async()=>{await navigator.clipboard.writeText(code);el('result').textContent=code+' — Copied';});
+async function list(){const d=await api('list');el('items').replaceChildren();for(const g of d.gifts){const s=document.createElement('section');const p=document.createElement('p');p.textContent=g.name+' | '+g.status+' | '+g.used+'/3 | '+g.created_at;s.append(p);if(g.status==='lifetime'){const c=document.createElement('button');c.textContent='SHOW CODE';c.onclick=()=>run(async()=>{code=(await api('code',{id:g.id})).code;el('result').textContent=code;el('copy').disabled=false;});s.append(c);const b=document.createElement('button');b.textContent='REVOKE';b.onclick=()=>run(async()=>{if(confirm('Revoke this gift?')){await api('revoke',{id:g.id});code='';el('copy').disabled=true;el('result').textContent='Revoked';await list();}});s.append(b);}el('items').append(s);}}
+el('list').onclick=()=>run(list);
+</script></html>`,{headers});
+  if(request.method!=='POST')return json({error:'Method not allowed'},405);
+  const origin=request.headers.get('Origin');
+  if(origin && origin!==new URL(request.url).origin)return json({error:'Origin forbidden'},403);
+  if(typeof env.GIFT_ADMIN_KEY!=='string'||env.GIFT_ADMIN_KEY.length<32)return json({error:'Admin secret not configured'},503);
+  const expected=await sha256('Bearer '+env.GIFT_ADMIN_KEY), actual=await sha256(request.headers.get('Authorization')||'');
+  let delta=0;for(let i=0;i<expected.length;i++)delta|=expected.charCodeAt(i)^actual.charCodeAt(i);
+  if(delta)return json({error:'Unauthorized'},401);
+  if(!env.DB||!env.ACTIVATION_ENCRYPTION_KEY||!productsReady(env))return json({error:'Service not configured'},503);
+  let data;try{data=await smallRequest(request)}catch{return json({error:'Invalid JSON'},400)}
+  try{
+    if(data?.action==='create'){
+      const name=typeof data.name==='string'?data.name.trim():'';
+      if(!name||name.length>160)return json({error:'Enter recipient name'},400);
+      const giftId='gift_'+crypto.randomUUID(), code=generateActivationCode(), secured=await protectCode(env,code);
+      // Separate metadata table; existing tables and commercial records unchanged.
+      await env.DB.prepare('CREATE TABLE IF NOT EXISTS teraphon_gifts (license_id TEXT PRIMARY KEY, recipient_name TEXT NOT NULL)').bind().run();
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO licenses (id,product_id,status,last_event_ms) VALUES (?1,?2,'lifetime',?3)").bind(giftId,products.lifetime,Date.now()),
+        env.DB.prepare('INSERT INTO teraphon_activation_codes (license_id,code_hash,code_cipher,code_nonce) VALUES (?1,?2,?3,?4)').bind(giftId,await sha256(code),secured.cipher,secured.nonce),
+        env.DB.prepare('INSERT INTO teraphon_gifts (license_id,recipient_name) VALUES (?1,?2)').bind(giftId,name)
+      ]);
+      return json({code:displayActivationCode(code),deviceLimit:3,plan:'lifetime'});
+    }
+    await env.DB.prepare('CREATE TABLE IF NOT EXISTS teraphon_gifts (license_id TEXT PRIMARY KEY, recipient_name TEXT NOT NULL)').bind().run();
+    if(data?.action==='list'){
+      const rows=await env.DB.prepare('SELECT l.id,g.recipient_name AS name,l.status,l.created_at,(SELECT COUNT(*) FROM license_devices d WHERE d.license_id=l.id) AS used FROM teraphon_gifts g JOIN licenses l ON l.id=g.license_id ORDER BY l.created_at DESC').bind().all();
+      return json({gifts:rows.results||[]});
+    }
+    if(!/^gift_[0-9a-f-]{36}$/.test(data?.id||''))return json({error:'Invalid gift ID'},400);
+    const gift=await env.DB.prepare('SELECT l.id,l.status FROM teraphon_gifts g JOIN licenses l ON l.id=g.license_id WHERE l.id=?1').bind(data.id).first();
+    if(!gift)return json({error:'Gift not found'},404);
+    if(data.action==='code'&&gift.status==='lifetime')return json({code:await codeForMail(env,gift.id)});
+    if(data.action==='revoke'){
+      await env.DB.prepare("UPDATE licenses SET status='revoked',updated_at=CURRENT_TIMESTAMP,last_event_ms=?2 WHERE id=?1 AND status='lifetime'").bind(gift.id,Date.now()).run();
+      return json({revoked:true});
+    }
+    return json({error:'Invalid action'},400);
+  }catch(e){return json({error:'Gift service unavailable'},503);}
+}
+
 export default {
   async fetch(request,env) {
     const u=new URL(request.url);
     const products=configuredProducts(env);
     const productPlan=planMap(products);
+    if(u.pathname==='/admin/gift') return giftAdmin(request,env,products);
     if (u.pathname==='/' && request.method==='GET') {
       return json({service:'TERAPHON Licensing',status:'online',
         webhookConfigured:Boolean(env.CREEM_WEBHOOK_SECRET),
